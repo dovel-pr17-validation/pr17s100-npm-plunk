@@ -1,0 +1,128 @@
+---
+title: Workflows
+description: Build automated, multi-step contact journeys triggered by events, segments, schedules, or manual entry
+icon: Workflow
+---
+
+Workflows are graph-based automations that move contacts through a sequence of steps — sending emails, waiting for activity, branching on conditions, calling webhooks, updating contact data, or exiting. Each contact that enters a workflow runs through it independently as a **workflow execution**.
+
+## Triggers
+
+A workflow has a single **trigger** that decides how contacts enter:
+
+| Trigger type | When it fires                                                                                          |
+| ------------ | ------------------------------------------------------------------------------------------------------ |
+| `EVENT`      | Any time a matching event is tracked on a contact (custom event via `/v1/track`, system events such as `email.received` or `contact.subscribed`, or segment entry/exit events). |
+| `MANUAL`     | Only when you explicitly start an execution via `POST /workflows/:id/executions`.                      |
+| `SCHEDULE`   | On a recurring schedule defined by `triggerConfig` (e.g. cron expression).                             |
+
+When you create a workflow via the API, the trigger defaults to `EVENT` with the event name you provide. To use `MANUAL` or `SCHEDULE`, change `triggerType` and `triggerConfig` with `PATCH /workflows/:id` after creation.
+
+A workflow's trigger event name **cannot be changed after the first execution** — pick it carefully. Other trigger configuration (delays, conditions inside steps) remains editable.
+
+## Lifecycle and the `enabled` flag
+
+Workflows are created with `enabled: false`. **No executions start until you flip `enabled` to `true`** — this is the most common reason "my workflow isn't firing."
+
+## Entry rules
+
+Each workflow decides who can enter it when its event fires. In the dashboard this is **Who can enter** in the workflow's settings; through the API it is `allowReentry` and `throttle`.
+
+| Rule                       | API                                   | A contact enters…                                                                     |
+| -------------------------- | ------------------------------------- | ------------------------------------------------------------------------------------- |
+| Once per contact (default) | `allowReentry: false`                 | One time, ever. Use it for welcome and onboarding sequences.                          |
+| Every time the event fires | `allowReentry: true`                  | Again on each event, even while an earlier run is still waiting in a delay.           |
+| At most once per period    | `allowReentry: true`, `throttle: "24h"` | At most once per period, and never while an earlier run is still going.             |
+
+### Throttling entry
+
+`throttle` takes the same value as [`delivery.throttle`](/guides/throttling) on `POST /v1/send`, so an event you track from a busy code path starts the workflow at most once per period. Events inside the period are ignored: no run is started and nothing is stored for them.
+
+```json
+{ "allowReentry": true, "throttle": "24h" }
+{ "allowReentry": true, "throttle": { "window": "24h", "key": "event.orgId" } }
+{ "allowReentry": true, "throttle": { "key": "event.period" } }
+```
+
+- **`window`**: from 1 minute (`"1m"`) to 365 days (`"365d"`). The period starts when the contact enters, because a run may branch or exit without sending anything.
+- **`key`**: a field to count separately for, read like a condition step's field: `event.*` from the event's data, `data.*` from the contact's data. With `event.orgId`, a person in two organisations enters once per period for each. If the field is missing on an event, it counts per contact.
+- **A key without a window** enters once per value, for example once per billing period when the event carries `period: "2026-10"`.
+- Setting a throttle turns `allowReentry` on. Setting `allowReentry: false` or `throttle: null` removes it.
+
+Starting a throttled workflow manually with `POST /workflows/:id/executions` returns `409` with the time the contact can enter again. Changing the throttle applies to the next entries; contacts already held keep their period.
+
+## Step types
+
+A workflow always begins with a single auto-created `TRIGGER` step. You build the rest of the graph by adding steps and **transitions** (edges) between them.
+
+| Step type         | Purpose                                                                                                | Required config                                                  |
+| ----------------- | ------------------------------------------------------------------------------------------------------ | ---------------------------------------------------------------- |
+| `TRIGGER`         | Auto-created entry point. Holds the trigger configuration.                                             | `eventName` (for `EVENT` trigger)                                |
+| `SEND_EMAIL`      | Sends an email to the contact using a template. Template variables resolve from contact data + execution context. | `templateId`, optional `from` override                  |
+| `DELAY`           | Pauses the execution for a fixed duration before continuing.                                           | `amount`, `unit` (`minutes` / `hours` / `days`)                  |
+| `WAIT_FOR_EVENT`  | Pauses until a specified event is tracked on the contact, with a timeout fallback.                     | `eventName`, `timeout` (seconds; `0` or omitted waits with no limit) |
+| `CONDITION`       | Branches the execution based on contact data or event data. Each `CONDITION` step has two outgoing transitions tagged `yes` / `no`. | A filter expression (same shape as segment filters) |
+| `WEBHOOK`         | Calls an external HTTPS endpoint with contact + execution context as the JSON body. `url`, header values, and `body` support `{{variables}}`. | `url`, optional `method`, `headers`, `body`            |
+| `UPDATE_CONTACT`  | Patches contact data — useful for tagging contacts as they progress (`{ stage: "activated" }`).        | `data` object                                                    |
+| `EXIT`            | Terminates the execution. Optionally records an `exitReason` for analytics.                            | optional `reason`                                                |
+
+## Transitions
+
+Transitions are the edges of the workflow graph. For most step types a transition is a simple "next" pointer. For `CONDITION` steps, each transition carries a `branch` discriminator (`"yes"` or `"no"`) so the engine knows which path to take when the condition evaluates.
+
+When deleting a step in the middle of a chain, pass `?splice=true` on `DELETE /workflows/:id/steps/:stepId` to automatically reconnect the surrounding transitions; otherwise the deletion leaves the graph disconnected.
+
+## Executions
+
+Each contact entering the workflow creates a `WorkflowExecution`. Executions move through these states:
+
+| Status      | Meaning                                                                                       |
+| ----------- | --------------------------------------------------------------------------------------------- |
+| `RUNNING`   | Currently processing a step (or about to).                                                    |
+| `WAITING`   | Paused inside a `DELAY` or `WAIT_FOR_EVENT` step.                                             |
+| `COMPLETED` | Reached the end of the graph successfully.                                                    |
+| `EXITED`    | Hit an `EXIT` step. `exitReason` records why.                                                 |
+| `FAILED`    | An unrecoverable error occurred (e.g. webhook returned non-2xx after retries, template not found). |
+| `CANCELLED` | Cancelled manually via the API or dashboard. Pending delays and waits do not resume it; a step already running finishes, and an email it queued is still sent. |
+
+Each execution carries a `context` JSON object that's merged with the contact's `data` when rendering templates and evaluating conditions. When you start an execution manually with `POST /workflows/:id/executions`, you can pass an initial `context` — this is how you parameterise per-execution variables (a coupon code, a referrer name) without storing them on the contact.
+
+## Locking active workflows
+
+A workflow is **locked** for structural edits while it has active (`RUNNING` or `WAITING`) executions. To make breaking changes — adding/removing steps, changing the trigger event, switching trigger type — first either:
+
+- Disable the workflow and wait for active executions to complete (an execution waiting on a `WAIT_FOR_EVENT` step with no timeout only completes when its event arrives), or
+- `POST /workflows/:id/executions/cancel-all` to cancel everything in flight.
+
+Cosmetic changes (renaming, editing template content referenced by steps) don't require this.
+
+## Common patterns
+
+- **Welcome series** — `EVENT` trigger on `signed_up`, send welcome email, delay 2 days, send tips email, delay 5 days, send upgrade nudge.
+- **Inbound auto-reply** — `EVENT` trigger on `email.received`, `CONDITION` on `event.spamVerdict == "PASS"`, then `SEND_EMAIL` with an auto-reply template. See [Receiving emails](/guides/receiving-emails).
+- **Re-engagement** — Triggered by a segment exit (`segment.active-users.exit`), send a "we miss you" email, then wait up to 7 days for an `email.open` event (an open of any email counts) before continuing.
+- **Webhook fan-out** — `EVENT` trigger on `purchase.completed`, `WEBHOOK` step to your CRM, `UPDATE_CONTACT` to tag `{ tier: "customer" }`, `SEND_EMAIL` with the receipt.
+
+## API reference
+
+Workflows are managed through the `/workflows` API. See the [API overview](/api-reference/overview#workflows) for the full route list — the API exposes endpoints for the workflow itself, its steps, its transitions, and its executions.
+
+## What's next
+
+<Cards>
+  <Card title="Templates" href="/concepts/templates">
+    Author the email content used by `SEND_EMAIL` steps.
+  </Card>
+  <Card title="Receiving emails" href="/guides/receiving-emails">
+    Trigger workflows from inbound mail with `email.received`.
+  </Card>
+  <Card title="Webhooks" href="/guides/webhooks">
+    Use `WEBHOOK` steps to call your own services from a workflow.
+  </Card>
+  <Card title="Segments" href="/concepts/segments">
+    Trigger workflows from segment entry / exit events.
+  </Card>
+  <Card title="Workflows overview" href="https://www.useplunk.com/features/workflows">
+    How teams use workflows for onboarding, lifecycle, and product email.
+  </Card>
+</Cards>

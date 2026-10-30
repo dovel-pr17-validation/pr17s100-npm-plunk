@@ -1,0 +1,21 @@
+{
+  "pages": [
+    "list-hygiene",
+    "verifying-domains",
+    "receiving-emails",
+    "tracking",
+    "api-keys",
+    "mcp-server",
+    "idempotency",
+    "scheduling",
+    "throttling",
+    "localization",
+    "webhooks",
+    "template-language",
+    "importing-contacts",
+    "custom-fields",
+    "segment-filters",
+    "unsubscribe-pages",
+    "data-retention"
+  ]
+}

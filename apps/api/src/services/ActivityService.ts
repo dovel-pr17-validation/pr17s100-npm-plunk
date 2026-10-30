@@ -1,0 +1,1163 @@
+import {EmailSourceType, EmailStatus, Prisma} from '@plunk/db';
+import type {Activity, ActivityStats, CursorPaginatedResponse} from '@plunk/types';
+import {ActivityType} from '@plunk/types';
+import signale from 'signale';
+
+import {prisma} from '../database/prisma.js';
+import {redis} from '../database/redis.js';
+import {HttpException} from '../exceptions/index.js';
+import {Keys} from './keys.js';
+
+/**
+ * Timestamp columns are `timestamp` holding UTC. Bounds are passed as UTC timestamps of the
+ * same type so the comparison is a plain index range, independent of session timezone.
+ */
+function utc(value: Prisma.DateTimeFilter['gte']): Prisma.Sql {
+  const date = value instanceof Date ? value : new Date(String(value));
+  return Prisma.sql`(${date.toISOString()}::timestamptz AT TIME ZONE 'UTC')`;
+}
+
+/** `AND` conditions for the bounds of a date filter, for raw queries; empty when unbounded */
+function timeRange(column: Prisma.Sql, filter: Prisma.DateTimeFilter): Prisma.Sql {
+  const bounds: Prisma.Sql[] = [];
+  if (filter.gte) bounds.push(Prisma.sql`AND ${column} >= ${utc(filter.gte)}`);
+  if (filter.lte) bounds.push(Prisma.sql`AND ${column} <= ${utc(filter.lte)}`);
+  if (filter.lt) bounds.push(Prisma.sql`AND ${column} < ${utc(filter.lt)}`);
+  return bounds.length > 0 ? Prisma.join(bounds, ' ') : Prisma.empty;
+}
+
+/**
+ * Activity Service
+ *
+ * PERFORMANCE CONSIDERATIONS:
+ * - Uses cursor-based pagination for efficient large dataset handling
+ * - Limits date range to prevent expensive queries (default 30 days)
+ * - Caches statistics in Redis with 5-minute TTL
+ * - Uses indexed fields (createdAt) for sorting
+ * - Batch processes and merges results from multiple tables
+ */
+/**
+ * The parts of an email needed to describe where a subscription change came
+ * from. The campaign / workflow names come along because they are what a user
+ * actually wants to know: which send lost them a subscriber.
+ */
+interface SubscriptionSourceEmail {
+  id: string;
+  subject: string;
+  campaign: {name: string} | null;
+  workflowExecution: {workflow: {name: string}} | null;
+}
+
+export class ActivityService {
+  private static readonly DEFAULT_LIMIT = 50;
+  private static readonly MAX_LIMIT = 100;
+  private static readonly DEFAULT_DAYS_BACK = 30;
+  private static readonly STATS_CACHE_TTL = 300; // 5 minutes
+
+  /**
+   * Reserved event names that represent a contact's subscription changing.
+   * These are written by ContactService, WorkflowExecutionService and
+   * EmailService, and are promoted out of the generic `event.triggered`
+   * bucket so the feed can label them properly and filter on them.
+   */
+  private static readonly SUBSCRIPTION_ACTIVITY_TYPES: Record<string, ActivityType> = {
+    'contact.subscribed': ActivityType.CONTACT_SUBSCRIBED,
+    'contact.unsubscribed': ActivityType.CONTACT_UNSUBSCRIBED,
+  };
+
+  /**
+   * Get unified activity feed for a project
+   *
+   * Performance: O(n log n) where n = limit
+   * - Fetches up to `limit` items from 3 tables in parallel
+   * - Merges and sorts by timestamp
+   * - Returns top `limit` items
+   *
+   * PAGINATION APPROACH:
+   * This implementation fetches `limit` items from each source (Events, Emails, Workflows),
+   * then merges and returns the top `limit` results by timestamp. This ensures a proper
+   * chronological timeline but has tradeoffs:
+   *
+   * Pros:
+   * - Proper time-based ordering across all activity types
+   * - Simple cursor-based pagination
+   * - Efficient for typical use cases
+   *
+   * Cons:
+   * - May fetch more items from DB than returned to client (up to 3x limit)
+   * - Cursor pagination across sources can miss items in rare edge cases
+   *
+   * For higher scale (10M+ activities), consider:
+   * - Materialized view or unified activity table
+   * - Event sourcing pattern with proper indexing
+   * - Separate pagination per activity type
+   */
+  public static async getActivities(
+    projectId: string,
+    limit = this.DEFAULT_LIMIT,
+    cursor?: string,
+    types?: ActivityType[],
+    contactId?: string,
+    startDate?: Date,
+    endDate?: Date,
+  ): Promise<CursorPaginatedResponse<Activity>> {
+    // Cap limit to prevent abuse
+    const effectiveLimit = Math.min(limit, this.MAX_LIMIT);
+
+    // One more than the page from each source: when only one source has activity, that
+    // extra row is the only way to tell a full last page from one with more behind it
+    const fetchLimit = effectiveLimit + 1;
+
+    // Default date range to last 30 days if not specified.
+    // IMPORTANT: When cursor is provided (pagination), we should NOT apply the gte constraint
+    // to allow users to paginate back beyond the initial date range.
+    //
+    // Contact-scoped feeds are exempt from the default 30-day floor: a single contact's
+    // history is naturally bounded (not the project-wide firehose the floor guards against),
+    // and older contacts whose newest event predates 30 days would otherwise show an empty
+    // first page with no "Load More" button to reach their history.
+    const now = new Date();
+    const defaultStartDate = new Date(now.getTime() - this.DEFAULT_DAYS_BACK * 24 * 60 * 60 * 1000);
+    const initialStartDate = startDate ?? (contactId ? undefined : defaultStartDate);
+    const dateFilter: Prisma.DateTimeFilter = {
+      // Only apply start date filter on initial load (no cursor)
+      // This allows pagination to go back indefinitely
+      ...(cursor || !initialStartDate ? {} : {gte: initialStartDate}),
+      ...(endDate ? {lte: endDate} : {}),
+    };
+
+    // Parse cursor if provided (format: timestamp_id)
+    let cursorTimestamp: Date | undefined;
+    let cursorId: string | undefined;
+    if (cursor) {
+      const [timestamp, id] = cursor.split('_');
+      cursorTimestamp = timestamp ? new Date(parseInt(timestamp)) : undefined;
+      cursorId = id;
+    }
+
+    // Fetch activities from different sources in parallel
+    // Each source fetches up to fetchLimit items
+    const [events, emails, workflows] = await Promise.all([
+      this.fetchEvents(projectId, fetchLimit, dateFilter, cursorTimestamp, cursorId, contactId, types),
+      this.fetchEmailActivities(projectId, fetchLimit, dateFilter, cursorTimestamp, cursorId, contactId, types),
+      this.fetchWorkflowActivities(projectId, fetchLimit, dateFilter, cursorTimestamp, cursorId, contactId, types),
+    ]);
+
+    // Merge all activities
+    const allActivities = [...events, ...emails, ...workflows];
+
+    // Sort by timestamp descending (most recent first)
+    allActivities.sort((a, b) => b.timestamp.getTime() - a.timestamp.getTime());
+
+    // Take only the requested limit + 1 (to check if there are more)
+    const paginatedActivities = allActivities.slice(0, effectiveLimit + 1);
+
+    // Check if there are more results
+    const hasMore = paginatedActivities.length > effectiveLimit;
+    const results = hasMore ? paginatedActivities.slice(0, effectiveLimit) : paginatedActivities;
+
+    // Generate cursor from the last item
+    const lastActivity = results[results.length - 1];
+    const nextCursor = hasMore && lastActivity ? `${lastActivity.timestamp.getTime()}_${lastActivity.id}` : undefined;
+
+    return {
+      data: results,
+      cursor: nextCursor,
+      hasMore,
+    };
+  }
+
+  /**
+   * The body of one email in the feed, for its preview.
+   *
+   * Kept out of the feed itself: bodies are full HTML documents, the feed repeats each
+   * email once per lifecycle step, and it is polled. Only the preview reads a body.
+   */
+  public static async getEmailBody(projectId: string, emailId: string): Promise<{body: string}> {
+    const email = await prisma.email.findFirst({
+      where: {id: emailId, projectId},
+      select: {body: true},
+    });
+
+    if (!email) {
+      throw new HttpException(404, 'Email not found');
+    }
+
+    return email;
+  }
+
+  /**
+   * Get activity statistics for a project
+   *
+   * Performance: Uses Redis cache with 5-minute TTL
+   * Falls back to database aggregation if cache miss
+   */
+  public static async getStats(projectId: string, startDate?: Date, endDate?: Date): Promise<ActivityStats> {
+    // Try to get from cache
+    const cacheKey = Keys.Activity.stats(projectId, startDate?.getTime() || 'all', endDate?.getTime() || 'now');
+
+    try {
+      const cached = await redis.get(cacheKey);
+      if (cached) {
+        return JSON.parse(cached);
+      }
+    } catch (error) {
+      signale.warn('[ACTIVITY] Failed to get stats from cache:', error);
+    }
+
+    // Default date range to last 30 days if not specified
+    const now = new Date();
+    const defaultStartDate = new Date(now.getTime() - this.DEFAULT_DAYS_BACK * 24 * 60 * 60 * 1000);
+    const dateFilter: Prisma.DateTimeFilter = {
+      gte: startDate || defaultStartDate,
+      ...(endDate ? {lte: endDate} : {}),
+    };
+
+    // Compute stats from database (in parallel for performance)
+    const [totalEvents, emailStats] = await Promise.all([
+      // Count total events
+      prisma.event.count({
+        where: {
+          projectId,
+          createdAt: dateFilter,
+        },
+      }),
+
+      // Aggregate email stats
+      prisma.email.aggregate({
+        where: {
+          projectId,
+          createdAt: dateFilter,
+        },
+        // _all rather than id: COUNT(*) can be served from emails_projectId_createdAt_stats_idx
+        // alone, COUNT("id") would need every row fetched since id is not in that index
+        _count: {
+          _all: true,
+          openedAt: true,
+          clickedAt: true,
+        },
+      }),
+    ]);
+
+    // Count workflow executions
+    const totalWorkflowsStarted = await prisma.workflowExecution.count({
+      where: {
+        workflow: {
+          projectId,
+        },
+        startedAt: dateFilter,
+      },
+    });
+
+    const totalEmailsSent = emailStats._count._all;
+    const totalEmailsOpened = emailStats._count.openedAt || 0;
+    const totalEmailsClicked = emailStats._count.clickedAt || 0;
+
+    const stats: ActivityStats = {
+      totalEvents,
+      totalEmailsSent,
+      totalEmailsOpened,
+      totalEmailsClicked,
+      totalWorkflowsStarted,
+      openRate: totalEmailsSent > 0 ? (totalEmailsOpened / totalEmailsSent) * 100 : 0,
+      clickRate: totalEmailsSent > 0 ? (totalEmailsClicked / totalEmailsSent) * 100 : 0,
+    };
+
+    // Cache for 5 minutes
+    try {
+      await redis.setex(cacheKey, this.STATS_CACHE_TTL, JSON.stringify(stats));
+    } catch (error) {
+      signale.warn('[ACTIVITY] Failed to cache stats:', error);
+    }
+
+    return stats;
+  }
+
+  /**
+   * Invalidate activity stats cache for a project
+   * Should be called when new activities are created
+   */
+  public static async invalidateStatsCache(projectId: string): Promise<void> {
+    try {
+      // Delete all cache keys for this project
+      const pattern = `activity:stats:${projectId}:*`;
+      const keys = await redis.keys(pattern);
+
+      if (keys.length > 0) {
+        await redis.del(...keys);
+      }
+    } catch (error) {
+      signale.warn('[ACTIVITY] Failed to invalidate stats cache:', error);
+    }
+  }
+
+  /**
+   * Short Redis TTL for recent-count results. Short enough to feel live on the
+   * dashboard live-pulse, long enough to absorb the polling load when many
+   * tabs are open across the user base.
+   */
+  private static readonly RECENT_COUNT_CACHE_TTL = 10; // seconds
+
+  /**
+   * Get recent activity count (for real-time updates)
+   * Returns count of activities in the last N minutes
+   *
+   * Backed by a short Redis cache because the dashboard polls this endpoint
+   * every 30 seconds per open tab; without the cache, every poll would run
+   * three COUNT queries against the events, emails, and workflow_executions
+   * tables.
+   */
+  public static async getRecentActivityCount(projectId: string, minutes = 5): Promise<number> {
+    const cacheKey = Keys.Activity.recentCount(projectId, minutes);
+
+    try {
+      const cached = await redis.get(cacheKey);
+      if (cached !== null) {
+        return parseInt(cached, 10);
+      }
+    } catch (error) {
+      signale.warn('[ACTIVITY] Failed to read recent-count cache:', error);
+    }
+
+    const since = new Date(Date.now() - minutes * 60 * 1000);
+    const dateFilter: Prisma.DateTimeFilter = {gte: since};
+
+    const [eventCount, emailCount, workflowCount] = await Promise.all([
+      prisma.event.count({
+        where: {projectId, createdAt: dateFilter},
+      }),
+      prisma.email.count({
+        where: {projectId, createdAt: dateFilter},
+      }),
+      prisma.workflowExecution.count({
+        where: {
+          workflow: {projectId},
+          startedAt: dateFilter,
+        },
+      }),
+    ]);
+
+    const total = eventCount + emailCount + workflowCount;
+
+    try {
+      await redis.setex(cacheKey, this.RECENT_COUNT_CACHE_TTL, total.toString());
+    } catch (error) {
+      signale.warn('[ACTIVITY] Failed to cache recent-count:', error);
+    }
+
+    return total;
+  }
+
+  /**
+   * Get upcoming scheduled activities for a project
+   *
+   * Fetches scheduled campaigns, workflow step executions and transactional
+   * emails (`delivery.at`) that are scheduled to send in the future.
+   *
+   * @param projectId - Project ID
+   * @param limit - Max number of items to return (default 50)
+   * @param daysAhead - How many days into the future to look (default 30)
+   */
+  public static async getUpcomingActivities(
+    projectId: string,
+    limit = this.DEFAULT_LIMIT,
+    daysAhead = this.DEFAULT_DAYS_BACK,
+  ): Promise<Activity[]> {
+    const effectiveLimit = Math.min(limit, this.MAX_LIMIT);
+    const now = new Date();
+    const futureDate = new Date(now.getTime() + daysAhead * 24 * 60 * 60 * 1000);
+
+    const dateFilter: Prisma.DateTimeFilter = {
+      gte: now,
+      lte: futureDate,
+    };
+
+    // Fetch scheduled items in parallel
+    const [scheduledCampaigns, scheduledWorkflowSteps, scheduledEmails] = await Promise.all([
+      this.fetchScheduledCampaigns(projectId, effectiveLimit, dateFilter),
+      this.fetchScheduledWorkflowSteps(projectId, effectiveLimit, dateFilter),
+      this.fetchScheduledTransactionalEmails(projectId, effectiveLimit, dateFilter),
+    ]);
+
+    // Merge all scheduled activities
+    const allActivities = [...scheduledCampaigns, ...scheduledWorkflowSteps, ...scheduledEmails];
+
+    // Sort by timestamp ascending (earliest first for upcoming items)
+    allActivities.sort((a, b) => a.timestamp.getTime() - b.timestamp.getTime());
+
+    // Return up to the limit
+    return allActivities.slice(0, effectiveLimit);
+  }
+
+  /**
+   * Fetch event activities
+   */
+  private static async fetchEvents(
+    projectId: string,
+    limit: number,
+    dateFilter: Prisma.DateTimeFilter,
+    cursorTimestamp?: Date,
+    cursorId?: string,
+    contactId?: string,
+    types?: ActivityType[],
+  ): Promise<Activity[]> {
+    // Subscription changes are stored as events with reserved names, but are
+    // surfaced as their own activity types rather than generic triggered events.
+    const requestedSubscriptionNames = Object.entries(this.SUBSCRIPTION_ACTIVITY_TYPES)
+      .filter(([, activityType]) => !types || types.includes(activityType))
+      .map(([eventName]) => eventName);
+    const includeTriggered = !types || types.includes(ActivityType.EVENT_TRIGGERED);
+
+    // Skip if neither generic events nor any subscription type was requested
+    if (!includeTriggered && requestedSubscriptionNames.length === 0) {
+      return [];
+    }
+
+    // Translate the requested types into a name filter. Both branches hit the
+    // (projectId, name, createdAt) index when a name predicate is present.
+    const excludedSubscriptionNames = Object.keys(this.SUBSCRIPTION_ACTIVITY_TYPES).filter(
+      name => !requestedSubscriptionNames.includes(name),
+    );
+    const nameFilter: Prisma.StringFilter | undefined = includeTriggered
+      ? excludedSubscriptionNames.length > 0
+        ? {notIn: excludedSubscriptionNames}
+        : undefined
+      : {in: requestedSubscriptionNames};
+
+    const where: Prisma.EventWhereInput = {
+      projectId,
+      ...(nameFilter ? {name: nameFilter} : {}),
+      // Plunk records every email open, click, bounce and delivery as an email.* event too.
+      // The feed already shows those as email activities, from the email rows, so listing the
+      // events as well would show each open twice and bury the project's own events.
+      NOT: {name: {startsWith: 'email.'}},
+      createdAt: cursorTimestamp
+        ? {
+            ...dateFilter,
+            lt: cursorTimestamp,
+          }
+        : dateFilter,
+      ...(contactId ? {contactId} : {}),
+    };
+
+    // A project's own events, unfiltered by name, go through the partial index instead. A
+    // contact's events and a filter on subscription names are served by ordinary indexes.
+    const ids =
+      includeTriggered && !contactId
+        ? await this.fetchRecentCustomEventIds(
+            projectId,
+            limit,
+            where.createdAt as Prisma.DateTimeFilter,
+            excludedSubscriptionNames,
+          )
+        : undefined;
+
+    if (ids?.length === 0) {
+      return [];
+    }
+
+    const events = await prisma.event.findMany({
+      where: ids ? {id: {in: ids}} : where,
+      orderBy: {createdAt: 'desc'},
+      take: limit,
+      include: {
+        contact: {
+          select: {
+            email: true,
+          },
+        },
+      },
+    });
+
+    const sourceEmails = await this.fetchSubscriptionSourceEmails(events);
+
+    return events.map(event => {
+      const type = this.SUBSCRIPTION_ACTIVITY_TYPES[event.name] ?? ActivityType.EVENT_TRIGGERED;
+      const sourceEmail = event.emailId ? sourceEmails.get(event.emailId) : undefined;
+
+      return {
+        id: event.id,
+        type,
+        timestamp: event.createdAt,
+        contactEmail: event.contact?.email,
+        contactId: event.contactId || undefined,
+        metadata: {
+          eventName: event.name,
+          eventData: event.data,
+          ...(sourceEmail
+            ? {
+                sourceEmailId: event.emailId,
+                sourceSubject: sourceEmail.subject,
+                campaignName: sourceEmail.campaign?.name,
+                workflowName: sourceEmail.workflowExecution?.workflow?.name,
+              }
+            : {}),
+        },
+      };
+    });
+  }
+
+  /**
+   * Ids of a project's most recent events, leaving out Plunk's own email.* events.
+   *
+   * Those make up nearly all of a sending project's events, so walking the
+   * (projectId, createdAt) index and filtering them out can read a month of email events
+   * to find a page of the project's own, or none at all on a transactional-only project.
+   * The partial index events_projectId_createdAt_custom_idx holds only the rows this feed
+   * shows. Raw SQL because Postgres only matches a partial index against a literal
+   * predicate, and Prisma would send the LIKE pattern as a parameter.
+   */
+  private static async fetchRecentCustomEventIds(
+    projectId: string,
+    limit: number,
+    createdAt: Prisma.DateTimeFilter,
+    excludedNames: string[],
+  ): Promise<string[]> {
+    const rows = await prisma.$queryRaw<{id: string}[]>`
+      SELECT id
+      FROM "events"
+      WHERE "projectId" = ${projectId}
+        AND "name" NOT LIKE 'email.%'
+        ${excludedNames.length > 0 ? Prisma.sql`AND "name" NOT IN (${Prisma.join(excludedNames)})` : Prisma.empty}
+        ${timeRange(Prisma.raw('"createdAt"'), createdAt)}
+      ORDER BY "createdAt" DESC
+      LIMIT ${limit}
+    `;
+
+    return rows.map(row => row.id);
+  }
+
+  /**
+   * Look up the emails that subscription events point at, so the feed can say
+   * which message a contact opted out from.
+   *
+   * Deliberately a second query rather than an `include` on the event fetch: only
+   * subscription events carry an `emailId` worth resolving, and joining the
+   * emails table on every page of a feed that is mostly custom events would pay
+   * for a relation nothing reads. Runs at most once per page, over at most
+   * `limit` ids, and is skipped entirely when no event on the page has a source.
+   */
+  private static async fetchSubscriptionSourceEmails(
+    events: {name: string; emailId: string | null}[],
+  ): Promise<Map<string, SubscriptionSourceEmail>> {
+    const emailIds = events
+      .filter(event => event.emailId && this.SUBSCRIPTION_ACTIVITY_TYPES[event.name])
+      .map(event => event.emailId as string);
+
+    if (emailIds.length === 0) {
+      return new Map();
+    }
+
+    const emails = await prisma.email.findMany({
+      where: {id: {in: [...new Set(emailIds)]}},
+      select: {
+        id: true,
+        subject: true,
+        campaign: {select: {name: true}},
+        workflowExecution: {select: {workflow: {select: {name: true}}}},
+      },
+    });
+
+    return new Map(emails.map(email => [email.id, email]));
+  }
+
+  /**
+   * Fetch email activities (sent, delivered, opened, clicked, bounced)
+   */
+  private static async fetchEmailActivities(
+    projectId: string,
+    limit: number,
+    dateFilter: Prisma.DateTimeFilter,
+    cursorTimestamp?: Date,
+    cursorId?: string,
+    contactId?: string,
+    types?: ActivityType[],
+  ): Promise<Activity[]> {
+    const activities: Activity[] = [];
+
+    // Determine which email statuses to fetch based on types filter
+    const emailTypes = types
+      ? types.filter(t => t.startsWith('email.'))
+      : Object.values(ActivityType).filter(t => t.startsWith('email.'));
+
+    if (emailTypes.length === 0) {
+      return [];
+    }
+
+    const where: Prisma.EmailWhereInput = {
+      projectId,
+      ...(contactId ? {contactId} : {}),
+      // Apply cursor-based pagination filter on createdAt
+      // This is critical for pagination to work correctly
+      createdAt: cursorTimestamp
+        ? {
+            ...dateFilter,
+            lt: cursorTimestamp,
+          }
+        : dateFilter,
+    };
+
+    // Build OR conditions to filter by the appropriate timestamp field for each activity type
+    // This ensures we fetch emails where the specific activity (bounced, sent, etc.) occurred in the date range
+    const orConditions: Prisma.EmailWhereInput[] = [];
+
+    if (!types || types.includes(ActivityType.EMAIL_SENT)) {
+      orConditions.push({sentAt: {not: null, ...dateFilter}});
+    }
+    if (!types || types.includes(ActivityType.EMAIL_DELIVERED)) {
+      orConditions.push({deliveredAt: {not: null, ...dateFilter}});
+    }
+    if (!types || types.includes(ActivityType.EMAIL_RECEIVED)) {
+      orConditions.push({deliveredAt: {not: null, ...dateFilter}, sourceType: 'INBOUND'});
+    }
+    if (!types || types.includes(ActivityType.EMAIL_OPENED)) {
+      orConditions.push({openedAt: {not: null, ...dateFilter}});
+    }
+    if (!types || types.includes(ActivityType.EMAIL_CLICKED)) {
+      orConditions.push({clickedAt: {not: null, ...dateFilter}});
+    }
+    if (!types || types.includes(ActivityType.EMAIL_BOUNCED)) {
+      orConditions.push({bouncedAt: {not: null, ...dateFilter}});
+    }
+    if (!types || types.includes(ActivityType.EMAIL_COMPLAINT)) {
+      orConditions.push({complainedAt: {not: null, ...dateFilter}});
+    }
+
+    // If no OR conditions, return empty (shouldn't happen but defensive)
+    if (orConditions.length === 0) {
+      return [];
+    }
+
+    const emails = await prisma.email.findMany({
+      where: {
+        ...where,
+        OR: orConditions,
+      },
+      orderBy: {createdAt: 'desc'},
+      take: limit,
+      // An explicit select, so the stored body is never read: it is the widest column by far
+      // and only the preview needs it (see getEmailBody)
+      select: {
+        id: true,
+        contactId: true,
+        campaignId: true,
+        templateId: true,
+        subject: true,
+        from: true,
+        fromName: true,
+        replyTo: true,
+        toName: true,
+        sourceType: true,
+        error: true,
+        opens: true,
+        clicks: true,
+        sentAt: true,
+        deliveredAt: true,
+        openedAt: true,
+        clickedAt: true,
+        bouncedAt: true,
+        complainedAt: true,
+        contact: {
+          select: {
+            email: true,
+          },
+        },
+        campaign: {
+          select: {
+            name: true,
+          },
+        },
+        workflowExecution: {
+          select: {
+            workflow: {
+              select: {
+                id: true,
+                name: true,
+              },
+            },
+          },
+        },
+      },
+    });
+
+    const outcomes = await this.fetchEmailOutcomes(emails, types);
+
+    // Helper function to check if timestamp is within date range
+    const isInDateRange = (timestamp: Date | null) => {
+      if (!timestamp) return false;
+
+      // Check against date filter
+      const time = timestamp.getTime();
+      if (dateFilter.gte) {
+        const gteTime = dateFilter.gte instanceof Date ? dateFilter.gte.getTime() : new Date(dateFilter.gte).getTime();
+        if (time < gteTime) return false;
+      }
+      if (dateFilter.lte) {
+        const lteTime = dateFilter.lte instanceof Date ? dateFilter.lte.getTime() : new Date(dateFilter.lte).getTime();
+        if (time > lteTime) return false;
+      }
+
+      // Check against cursor for pagination
+      if (cursorTimestamp && time >= cursorTimestamp.getTime()) return false;
+
+      return true;
+    };
+
+    // Convert each email into multiple activities based on its state
+    for (const email of emails) {
+      const baseMetadata = {
+        subject: email.subject,
+        from: email.from,
+        fromName: email.fromName,
+        replyTo: email.replyTo,
+        toName: email.toName,
+        sourceType: email.sourceType,
+        campaignName: email.campaign?.name,
+        workflowName: email.workflowExecution?.workflow?.name,
+        // Ids so the feed can link to the email's source
+        emailId: email.id,
+        campaignId: email.campaignId,
+        templateId: email.templateId,
+        workflowId: email.workflowExecution?.workflow?.id,
+      };
+      const outcome = outcomes.get(email.id);
+
+      if (email.sentAt && (!types || types.includes(ActivityType.EMAIL_SENT)) && isInDateRange(email.sentAt)) {
+        activities.push({
+          id: `${email.id}_sent`,
+          type: ActivityType.EMAIL_SENT,
+          timestamp: email.sentAt,
+          contactEmail: email.contact.email,
+          contactId: email.contactId,
+          metadata: baseMetadata,
+        });
+      }
+
+      if (
+        email.deliveredAt &&
+        (!types || types.includes(ActivityType.EMAIL_DELIVERED)) &&
+        isInDateRange(email.deliveredAt)
+      ) {
+        activities.push({
+          id: `${email.id}_delivered`,
+          type: ActivityType.EMAIL_DELIVERED,
+          timestamp: email.deliveredAt,
+          contactEmail: email.contact.email,
+          contactId: email.contactId,
+          metadata: baseMetadata,
+        });
+      }
+
+      if (
+        email.deliveredAt &&
+        email.sourceType === 'INBOUND' &&
+        (!types || types.includes(ActivityType.EMAIL_RECEIVED)) &&
+        isInDateRange(email.deliveredAt)
+      ) {
+        activities.push({
+          id: `${email.id}_received`,
+          type: ActivityType.EMAIL_RECEIVED,
+          timestamp: email.deliveredAt,
+          contactEmail: email.contact.email,
+          contactId: email.contactId,
+          metadata: baseMetadata,
+        });
+      }
+
+      if (email.openedAt && (!types || types.includes(ActivityType.EMAIL_OPENED)) && isInDateRange(email.openedAt)) {
+        activities.push({
+          id: `${email.id}_opened`,
+          type: ActivityType.EMAIL_OPENED,
+          timestamp: email.openedAt,
+          contactEmail: email.contact.email,
+          contactId: email.contactId,
+          metadata: {
+            ...baseMetadata,
+            totalOpens: email.opens,
+          },
+        });
+      }
+
+      // Email clicked
+      if (email.clickedAt && (!types || types.includes(ActivityType.EMAIL_CLICKED)) && isInDateRange(email.clickedAt)) {
+        activities.push({
+          id: `${email.id}_clicked`,
+          type: ActivityType.EMAIL_CLICKED,
+          timestamp: email.clickedAt,
+          contactEmail: email.contact.email,
+          contactId: email.contactId,
+          metadata: {
+            ...baseMetadata,
+            totalClicks: email.clicks,
+            link: outcome?.link,
+          },
+        });
+      }
+
+      // Email bounced
+      if (email.bouncedAt && (!types || types.includes(ActivityType.EMAIL_BOUNCED)) && isInDateRange(email.bouncedAt)) {
+        activities.push({
+          id: `${email.id}_bounced`,
+          type: ActivityType.EMAIL_BOUNCED,
+          timestamp: email.bouncedAt,
+          contactEmail: email.contact.email,
+          contactId: email.contactId,
+          metadata: {
+            ...baseMetadata,
+            error: email.error,
+            bounceType: outcome?.bounceType,
+          },
+        });
+      }
+
+      // Email complaint
+      if (
+        email.complainedAt &&
+        (!types || types.includes(ActivityType.EMAIL_COMPLAINT)) &&
+        isInDateRange(email.complainedAt)
+      ) {
+        activities.push({
+          id: `${email.id}_complaint`,
+          type: ActivityType.EMAIL_COMPLAINT,
+          timestamp: email.complainedAt,
+          contactEmail: email.contact.email,
+          contactId: email.contactId,
+          metadata: {
+            ...baseMetadata,
+            error: email.error,
+          },
+        });
+      }
+    }
+
+    return activities;
+  }
+
+  /**
+   * What the email rows on a page cannot say themselves: which link was clicked and what
+   * kind of bounce it was. Both live only on the email's events.
+   *
+   * One query per page, over at most `limit` emails, served by the events (emailId) index,
+   * and skipped when the page has no clicked or bounced email the caller asked for.
+   */
+  private static async fetchEmailOutcomes(
+    emails: {id: string; clickedAt: Date | null; bouncedAt: Date | null}[],
+    types?: ActivityType[],
+  ): Promise<Map<string, {link?: string; bounceType?: string}>> {
+    const wantClicks = !types || types.includes(ActivityType.EMAIL_CLICKED);
+    const wantBounces = !types || types.includes(ActivityType.EMAIL_BOUNCED);
+    const ids = emails
+      .filter(email => (wantClicks && email.clickedAt) || (wantBounces && email.bouncedAt))
+      .map(email => email.id);
+
+    const outcomes = new Map<string, {link?: string; bounceType?: string}>();
+    if (ids.length === 0) {
+      return outcomes;
+    }
+
+    const events = await prisma.event.findMany({
+      where: {emailId: {in: ids}, name: {in: ['email.click', 'email.bounce']}},
+      select: {emailId: true, name: true, data: true},
+      // Oldest first, so the first click and the bounce that suppressed the contact win
+      orderBy: {createdAt: 'asc'},
+    });
+
+    for (const event of events) {
+      if (!event.emailId) continue;
+      const data = event.data && typeof event.data === 'object' && !Array.isArray(event.data) ? event.data : {};
+      const outcome = outcomes.get(event.emailId) ?? {};
+
+      if (event.name === 'email.click' && !outcome.link && typeof data.link === 'string') {
+        outcome.link = data.link;
+      }
+      // Transient bounces never set bouncedAt, so they are not the bounce this row shows
+      if (
+        event.name === 'email.bounce' &&
+        !outcome.bounceType &&
+        typeof data.bounceType === 'string' &&
+        data.bounceType !== 'Transient'
+      ) {
+        outcome.bounceType = data.bounceType;
+      }
+
+      outcomes.set(event.emailId, outcome);
+    }
+
+    return outcomes;
+  }
+
+  /**
+   * Fetch workflow activities
+   */
+  private static async fetchWorkflowActivities(
+    projectId: string,
+    limit: number,
+    dateFilter: Prisma.DateTimeFilter,
+    cursorTimestamp?: Date,
+    cursorId?: string,
+    contactId?: string,
+    types?: ActivityType[],
+  ): Promise<Activity[]> {
+    // Skip if filtering by types and workflow types are not included
+    if (types && !types.some(t => t.startsWith('workflow.'))) {
+      return [];
+    }
+
+    const activities: Activity[] = [];
+
+    const startedAt: Prisma.DateTimeFilter = cursorTimestamp ? {...dateFilter, lt: cursorTimestamp} : dateFilter;
+
+    // A contact's executions are few and served by the (contactId, status) index. A whole
+    // project's are not: they are found through its workflows, so they go through the
+    // per-workflow lookup below rather than Prisma's relation filter.
+    const ids = contactId ? undefined : await this.fetchRecentWorkflowExecutionIds(projectId, limit, startedAt);
+
+    if (ids?.length === 0) {
+      return [];
+    }
+
+    const executions = await prisma.workflowExecution.findMany({
+      where: ids ? {id: {in: ids}} : {workflow: {projectId}, contactId, startedAt},
+      orderBy: {startedAt: 'desc'},
+      take: limit,
+      include: {
+        contact: {
+          select: {
+            email: true,
+          },
+        },
+        workflow: {
+          select: {
+            id: true,
+            name: true,
+          },
+        },
+      },
+    });
+
+    for (const execution of executions) {
+      // Workflow started
+      if (!types || types.includes(ActivityType.WORKFLOW_STARTED)) {
+        activities.push({
+          id: `${execution.id}_started`,
+          type: ActivityType.WORKFLOW_STARTED,
+          timestamp: execution.startedAt,
+          contactEmail: execution.contact?.email,
+          contactId: execution.contactId,
+          metadata: {
+            workflowId: execution.workflow.id,
+            workflowName: execution.workflow.name,
+            status: execution.status,
+          },
+        });
+      }
+
+      // Workflow completed
+      if (execution.completedAt && (!types || types.includes(ActivityType.WORKFLOW_COMPLETED))) {
+        activities.push({
+          id: `${execution.id}_completed`,
+          type: ActivityType.WORKFLOW_COMPLETED,
+          timestamp: execution.completedAt,
+          contactEmail: execution.contact?.email,
+          contactId: execution.contactId,
+          metadata: {
+            workflowId: execution.workflow.id,
+            workflowName: execution.workflow.name,
+            status: execution.status,
+            exitReason: execution.exitReason,
+          },
+        });
+      }
+    }
+
+    return activities;
+  }
+
+  /**
+   * Ids of a project's most recently started workflow executions.
+   *
+   * Executions carry no projectId, so Prisma's `workflow: {projectId}` filter becomes
+   * `workflowId IN (...)`, which Postgres answers by loading every execution of every
+   * workflow in the project and sorting them: hundreds of milliseconds on a project with a
+   * long history. Here each workflow contributes only its newest `limit` executions, read
+   * in order from the (workflowId, startedAt) index, and those are merged. The cost is
+   * bounded by workflows × limit, however many executions the project has.
+   */
+  private static async fetchRecentWorkflowExecutionIds(
+    projectId: string,
+    limit: number,
+    startedAt: Prisma.DateTimeFilter,
+  ): Promise<string[]> {
+    const rows = await prisma.$queryRaw<{id: string}[]>`
+      SELECT recent.id
+      FROM "workflows" w
+      CROSS JOIN LATERAL (
+        SELECT we.id, we."startedAt"
+        FROM "workflow_executions" we
+        WHERE we."workflowId" = w.id ${timeRange(Prisma.raw('we."startedAt"'), startedAt)}
+        ORDER BY we."startedAt" DESC
+        LIMIT ${limit}
+      ) recent
+      WHERE w."projectId" = ${projectId}
+      ORDER BY recent."startedAt" DESC
+      LIMIT ${limit}
+    `;
+
+    return rows.map(row => row.id);
+  }
+
+  /**
+   * Fetch scheduled campaigns
+   */
+  private static async fetchScheduledCampaigns(
+    projectId: string,
+    limit: number,
+    dateFilter: Prisma.DateTimeFilter,
+  ): Promise<Activity[]> {
+    const campaigns = await prisma.campaign.findMany({
+      where: {
+        projectId,
+        status: 'SCHEDULED',
+        scheduledFor: dateFilter,
+      },
+      orderBy: {scheduledFor: 'asc'},
+      take: limit,
+      include: {
+        segment: {
+          select: {
+            name: true,
+          },
+        },
+      },
+    });
+
+    return campaigns.map(campaign => ({
+      id: `campaign_${campaign.id}_scheduled`,
+      type: ActivityType.CAMPAIGN_SCHEDULED,
+      timestamp: campaign.scheduledFor!,
+      metadata: {
+        campaignName: campaign.name,
+        subject: campaign.subject,
+        totalRecipients: campaign.totalRecipients,
+        segmentName: campaign.segment?.name,
+        audienceType: campaign.audienceType,
+      },
+    }));
+  }
+
+  /**
+   * Fetch scheduled transactional emails (`delivery.at` on POST /v1/send). Served by the
+   * partial index on SCHEDULED emails, which holds only the ones still waiting.
+   */
+  private static async fetchScheduledTransactionalEmails(
+    projectId: string,
+    limit: number,
+    dateFilter: Prisma.DateTimeFilter,
+  ): Promise<Activity[]> {
+    const emails = await prisma.email.findMany({
+      where: {
+        projectId,
+        status: EmailStatus.SCHEDULED,
+        scheduledFor: dateFilter,
+      },
+      orderBy: {scheduledFor: 'asc'},
+      take: limit,
+      select: {
+        id: true,
+        subject: true,
+        from: true,
+        fromName: true,
+        toName: true,
+        templateId: true,
+        scheduledFor: true,
+        contactId: true,
+        contact: {select: {email: true}},
+      },
+    });
+
+    return emails.map(email => ({
+      id: `transactional_${email.id}_scheduled`,
+      type: ActivityType.TRANSACTIONAL_SCHEDULED,
+      timestamp: email.scheduledFor!,
+      contactEmail: email.contact.email,
+      contactId: email.contactId,
+      metadata: {
+        emailId: email.id,
+        subject: email.subject,
+        from: email.from,
+        fromName: email.fromName,
+        toName: email.toName,
+        templateId: email.templateId,
+        sourceType: EmailSourceType.TRANSACTIONAL,
+      },
+    }));
+  }
+
+  /**
+   * Fetch scheduled workflow step executions (emails with delays)
+   */
+  private static async fetchScheduledWorkflowSteps(
+    projectId: string,
+    limit: number,
+    dateFilter: Prisma.DateTimeFilter,
+  ): Promise<Activity[]> {
+    const stepExecutions = await prisma.workflowStepExecution.findMany({
+      where: {
+        execution: {
+          workflow: {
+            projectId,
+          },
+        },
+        status: 'PENDING',
+        scheduledFor: dateFilter,
+      },
+      orderBy: {scheduledFor: 'asc'},
+      take: limit,
+      include: {
+        execution: {
+          include: {
+            contact: {
+              select: {
+                email: true,
+              },
+            },
+            workflow: {
+              select: {
+                name: true,
+              },
+            },
+          },
+        },
+        step: {
+          select: {
+            name: true,
+            type: true,
+            config: true,
+          },
+        },
+      },
+    });
+
+    return stepExecutions
+      .filter(stepExec => stepExec.step.type === 'SEND_EMAIL' && stepExec.scheduledFor)
+      .map(stepExec => ({
+        id: `workflow_step_${stepExec.id}_scheduled`,
+        type: ActivityType.WORKFLOW_EMAIL_SCHEDULED,
+        timestamp: stepExec.scheduledFor!,
+        contactEmail: stepExec.execution.contact?.email,
+        contactId: stepExec.execution.contactId,
+        metadata: {
+          workflowName: stepExec.execution.workflow.name,
+          stepName: stepExec.step.name,
+          subject:
+            stepExec.step.config &&
+            typeof stepExec.step.config === 'object' &&
+            stepExec.step.config !== null &&
+            'subject' in stepExec.step.config &&
+            typeof (stepExec.step.config as Record<string, unknown>).subject === 'string'
+              ? (stepExec.step.config as Record<string, unknown>).subject
+              : undefined,
+        },
+      }));
+  }
+}
